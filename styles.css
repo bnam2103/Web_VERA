@@ -235,7 +235,6 @@ body {
    MOBILE-ONLY SERVER STATUS
 ========================= */
 
-/* Default: hide mobile status */
 .mobile-only {
   display: none;
 }
@@ -243,7 +242,6 @@ body {
 /* PHONE VIEW */
 @media (max-width: 768px) {
 
-  /* Hide sidebar */
   .sidebar {
     display: none;
   }
@@ -256,7 +254,6 @@ body {
     display: inline;
   }
 
-  /* ⬆️ LIFT INPUT BAR ABOVE SYSTEM NAV BAR */
   .input-bar {
     justify-content: space-between;
     gap: 12px;
@@ -265,7 +262,6 @@ body {
       14px + env(safe-area-inset-bottom)
     );
 
-    /* Optional but recommended */
     position: sticky;
     bottom: 0;
   }
@@ -281,3 +277,4 @@ body {
     padding-left: 12px;
   }
 }
+
