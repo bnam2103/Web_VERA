@@ -1,0 +1,5 @@
+Run Fast API: py -m uvicorn app:app --host 0.0.0.0 --port 8000 (make sure to cd)
+Run public tunneling: cloudflared tunnel --url http://localhost:8000
+then change the url in index.js
+Deploy worker: wrangler deploy (make sure to cd vera-api)
+check if it works: curl.exe https://vera-api.vera-api-ned.workers.dev/health

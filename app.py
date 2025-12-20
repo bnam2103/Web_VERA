@@ -12,7 +12,9 @@ import numpy as np
 import io
 import json
 import string
+from time import perf_counter
 
+from intent import is_command
 from ASR import transcribe_long
 from LLM import VeraAI
 from TTS import speak_to_file
@@ -23,9 +25,13 @@ from pydub import AudioSegment
 # =========================
 
 MODEL_PATH = r"C:\Users\User\Documents\Fine_Tuning_Projects\LLAMA_LLM_3B"
+
 MAX_ACTIVE_USERS = 10
-SESSION_TTL = 30 * 60  # 30 minutes
+SESSION_TTL = 30 * 60
 MAX_TURNS = 20
+TARGET_SR = 16000
+MIN_AUDIO_BYTES = 1500
+MAX_FEEDBACK_BYTES = 1 * 1024 * 1024  # 1 MB
 
 # =========================
 # APP
@@ -41,22 +47,26 @@ app.add_middleware(
 )
 
 # =========================
-# GLOBAL MODEL & GPU LOCK
+# MODELS & LOCKS
 # =========================
 
 vera = VeraAI(MODEL_PATH)
-gpu_lock = asyncio.Lock()
+
+asr_lock = asyncio.Lock()
+llm_lock = asyncio.Lock()
+tts_lock = asyncio.Lock()
 
 # =========================
-# SESSION STATE (UUID ONLY)
+# SESSION STATE
 # =========================
 
-user_histories = defaultdict(list)   # session_id -> chat turns
+user_histories = defaultdict(list)
 user_last_seen = {}
 total_sessions_seen = set()
+paused_sessions = set()
 
 # =========================
-# BASIC HELPERS
+# HELPERS
 # =========================
 
 def safe_id(value: str) -> str:
@@ -77,107 +87,50 @@ def cleanup_sessions():
     for sid in expired:
         user_histories.pop(sid, None)
         user_last_seen.pop(sid, None)
+        paused_sessions.discard(sid)
 
 # =========================
-# TIME / DATE RESPONSES
+# SIMPLE INTENTS
 # =========================
 
 def check_time():
-    now = datetime.now()
-    return f"The current time is {now.strftime('%I:%M %p')}."
+    return f"The current time is {datetime.now().strftime('%I:%M %p')}."
 
 def check_date():
-    today_dt = datetime.now()
-    return f"Today's date is {today_dt.strftime('%A, %B %d, %Y')}."
+    return f"Today's date is {datetime.now().strftime('%A, %B %d, %Y')}."
 
-# =========================
-# PROMPT BUILDER (FINAL)
-# =========================
-
-def build_messages(history: list | None, user_text: str):
-    """
-    - Stable VERA identity
-    - No user identity
-    - Creator info only when explicitly asked
-    """
-
-    if history is None:
-        history = []
-
-    user_text_l = user_text.lower()
-
-    creator_triggers = [
-        "who made you",
-        "who created you",
-        "your creator",
-        "your origin",
-        "who built you"
-    ]
-
-    creator_allowed = any(t in user_text_l for t in creator_triggers)
-
-    system_content = (
-        vera.base_system_prompt
-        + "\n\nIMPORTANT RULES:\n"
-          "You are VERA, a conversational voice-based AI.\n"
-          "Speak calmly, professionally, and concisely.\n"
-          "Do not use markdown, emojis, or formatting.\n"
-          "Your output will be spoken aloud.\n\n"
-    )
-
-    if creator_allowed:
-        system_content += (
-            "\nCREATOR INFORMATION:\n"
-            + vera.creator_info + "\n"
-        )
-    else:
-        system_content += (
-            "\nDo NOT mention or reference your creator unless explicitly asked.\n"
-        )
-
-    messages = [{"role": "system", "content": system_content}]
-
-    if history:
-        messages.extend(history)
-
-    messages.append({
-        "role": "user",
-        "content": user_text
-    })
-
-    return messages
-
-# =========================
-# INTENT CHECK (LLM-BASED)
-# =========================
-
-def is_time_or_date_query(history, text: str) -> str | None:
-    """
-    Uses LLM phrasing to normalize many time/date question variants.
-    """
+def detect_intent(text: str) -> str | None:
     cleaned = text.lower().translate(
         str.maketrans("", "", string.punctuation)
     )
 
-    messages = build_messages(history, cleaned)
-    normalized = vera.generate(messages).lower()
-
-    if "current time" in normalized:
+    if any(k in cleaned for k in ["time", "clock"]):
         return "time"
-
-    if "current date" in normalized:
+    if any(k in cleaned for k in ["date", "day", "today"]):
         return "date"
 
     return None
 
 # =========================
-# AUDIO PATHS (UUID ONLY)
+# PROMPT BUILDER
 # =========================
 
-def user_audio_dir(session_id):
-    p = Path("audio_logs") / session_id / today()
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+def build_messages(history, user_text):
+    system = (
+        vera.base_system_prompt
+        + "\n\nYou are VERA, a calm professional voice assistant."
+        + "\nDo not use markdown, emojis, or formatting."
+        + "\nYour output will be spoken aloud."
+    )
+
+    messages = [{"role": "system", "content": system}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_text})
+    return messages
+
+# =========================
+# AUDIO PATHS
+# =========================
 
 def user_tts_dir(session_id):
     p = Path("tts_outputs") / session_id / today()
@@ -193,18 +146,18 @@ def user_feedback_dir(session_id):
 # METRICS LOGGER
 # =========================
 
-async def log_metrics_periodically():
+async def log_metrics():
     while True:
         cleanup_sessions()
         print(
-            f"[METRICS] Active users: {len(user_last_seen)}/{MAX_ACTIVE_USERS} | "
-            f"GPU: {'BUSY' if gpu_lock.locked() else 'IDLE'}"
+            f"[METRICS] users={len(user_last_seen)}/{MAX_ACTIVE_USERS} | "
+            f"ASR={asr_lock.locked()} LLM={llm_lock.locked()} TTS={tts_lock.locked()}"
         )
         await asyncio.sleep(10)
 
 @app.on_event("startup")
-async def start_metrics_logger():
-    asyncio.create_task(log_metrics_periodically())
+async def startup():
+    asyncio.create_task(log_metrics())
 
 # =========================
 # INFERENCE
@@ -215,53 +168,106 @@ async def infer(
     audio: UploadFile = File(...),
     session_id: str = Form(...),
 ):
+    t_start = perf_counter()
+
     session_id = safe_id(session_id)
     cleanup_sessions()
 
     if session_id not in user_last_seen and len(user_last_seen) >= MAX_ACTIVE_USERS:
-        raise HTTPException(429, "VERA is currently at capacity.")
+        raise HTTPException(429, "Server at capacity")
 
     user_last_seen[session_id] = time()
     total_sessions_seen.add(session_id)
 
     audio_bytes = await audio.read()
-    audio_seg = AudioSegment.from_file(io.BytesIO(audio_bytes))
-    audio_seg = audio_seg.set_frame_rate(16000).set_channels(1)
+    if len(audio_bytes) < MIN_AUDIO_BYTES:
+        return {"skip": True}
 
-    samples = np.array(audio_seg.get_array_of_samples(), dtype=np.float32) / 32768.0
+    try:
+        seg = AudioSegment.from_file(io.BytesIO(audio_bytes))
+    except Exception:
+        raise HTTPException(400, "Invalid audio format")
 
-    async with gpu_lock:
+    seg = seg.set_channels(1).set_frame_rate(TARGET_SR)
 
+    samples = np.array(seg.get_array_of_samples(), dtype=np.float32) / 32768.0
+    samples -= np.mean(samples)
+    peak = np.max(np.abs(samples))
+    if peak > 0:
+        samples /= peak
+
+    # =========================
+    # ASR (ALWAYS ON)
+    # =========================
+
+    async with asr_lock:
         transcript = transcribe_long(samples).strip()
 
-        history = user_histories[session_id]
+    if not transcript:
+        return {"skip": True}
 
-        if not transcript:
-            reply = "I didn’t catch that. Could you try again?"
-        else:
-            intent = is_time_or_date_query(history, transcript)
+    print(f"[ASR] \"{transcript}\"")
 
-            if intent == "time":
-                reply = check_time()
+    # =========================
+    # COMMAND HANDLING
+    # =========================
 
-            elif intent == "date":
-                reply = check_date()
+    if is_command(transcript):
+        t = transcript.lower()
 
-            else:
-                messages = build_messages(history, transcript)
-                reply = vera.generate(messages).strip()
+        if "pause" in t and "unpause" not in t:
+            paused_sessions.add(session_id)
+            print(f"[COMMAND] PAUSE session={session_id}")
+            return {"command": "pause"}
 
-                history.append({"role": "user", "content": transcript})
-                history.append({"role": "assistant", "content": reply})
+        if "unpause" in t:
+            paused_sessions.discard(session_id)
+            print(f"[COMMAND] UNPAUSE session={session_id}")
+            return {"command": "unpause"}
 
-                if len(history) > MAX_TURNS * 2:
-                    history[:] = history[-MAX_TURNS * 2:]
+    # =========================
+    # PAUSED MODE → ASR ONLY
+    # =========================
 
-        tts_dir = user_tts_dir(session_id)
-        fname = f"{timestamp()}.wav"
-        tts_path = tts_dir / fname
+    if session_id in paused_sessions:
+        print("[STATE] Paused — ASR active, LLM/TTS blocked")
+        return {"paused": True, "transcript": transcript}
 
-        speak_to_file(reply, tts_path)
+    history = user_histories[session_id]
+
+    # =========================
+    # LLM
+    # =========================
+
+    intent = detect_intent(transcript)
+
+    if intent == "time":
+        reply = check_time()
+    elif intent == "date":
+        reply = check_date()
+    else:
+        messages = build_messages(history, transcript)
+        async with llm_lock:
+            reply = vera.generate(messages).strip()
+
+        history.append({"role": "user", "content": transcript})
+        history.append({"role": "assistant", "content": reply})
+
+        if len(history) > MAX_TURNS * 2:
+            history[:] = history[-MAX_TURNS * 2:]
+
+    # =========================
+    # TTS
+    # =========================
+
+    tts_dir = user_tts_dir(session_id)
+    fname = f"{timestamp()}.wav"
+    path = tts_dir / fname
+
+    async with tts_lock:
+        speak_to_file(reply, path)
+
+    print(f"[LATENCY] TOTAL={perf_counter() - t_start:.3f}s")
 
     return {
         "transcript": transcript,
@@ -293,7 +299,6 @@ def metrics():
     cleanup_sessions()
     return {
         "active_users": len(user_last_seen),
-        "gpu_busy": gpu_lock.locked(),
         "total_sessions_seen": len(total_sessions_seen),
     }
 
@@ -309,6 +314,10 @@ class Feedback(BaseModel):
 
 @app.post("/feedback")
 async def receive_feedback(data: Feedback):
+    size = len(data.feedback.encode("utf-8"))
+    if size > MAX_FEEDBACK_BYTES:
+        raise HTTPException(413, "Feedback exceeds 1MB limit")
+
     path = user_feedback_dir(safe_id(data.session_id)) / "feedback.jsonl"
 
     entry = data.dict()

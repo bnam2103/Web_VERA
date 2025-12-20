@@ -223,6 +223,9 @@ def speak_to_file(text: str, output_path: Path) -> Path:
         "NATO": "NAYTOH",
         "RADAR": "RAYDAR",
         "SCUBA": "scuba",
+        "≠": "does not equal",
+        "°C": "degrees Celsius",
+        "°F": "degrees Fahrenheit",
     }
 
     def replace_all_caps(match):
