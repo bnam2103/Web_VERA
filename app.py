@@ -6,13 +6,12 @@ from pydantic import BaseModel
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
-from time import time
+from time import time, perf_counter
 import asyncio
 import numpy as np
 import io
 import json
 import string
-from time import perf_counter
 
 from intent import is_command
 from ASR import transcribe_long
@@ -29,8 +28,14 @@ MODEL_PATH = r"C:\Users\User\Documents\Fine_Tuning_Projects\LLAMA_LLM_3B"
 MAX_ACTIVE_USERS = 10
 SESSION_TTL = 30 * 60
 MAX_TURNS = 20
+
 TARGET_SR = 16000
 MIN_AUDIO_BYTES = 1500
+MIN_AUDIO_RMS = 0.015  # 🔑 ENERGY GATE (MATCHES FRONTEND)
+MIN_VOICED_SECONDS = 0.05   # 🔑 NEW
+ZCR_MIN = 0.01
+ZCR_MAX = 0.35             # 🔑 NEW
+
 MAX_FEEDBACK_BYTES = 1 * 1024 * 1024  # 1 MB
 
 # =========================
@@ -89,6 +94,15 @@ def cleanup_sessions():
         user_last_seen.pop(sid, None)
         paused_sessions.discard(sid)
 
+def zero_crossing_rate(samples: np.ndarray) -> float:
+    return np.mean(samples[:-1] * samples[1:] < 0)
+
+def voiced_duration(samples: np.ndarray, sr: int, thresh: float) -> float:
+    mask = np.abs(samples) > thresh
+    if not mask.any():
+        return 0.0
+    idx = np.where(mask)[0]
+    return (idx[-1] - idx[0]) / sr
 # =========================
 # SIMPLE INTENTS
 # =========================
@@ -191,13 +205,39 @@ async def infer(
     seg = seg.set_channels(1).set_frame_rate(TARGET_SR)
 
     samples = np.array(seg.get_array_of_samples(), dtype=np.float32) / 32768.0
+
+    # =========================
+    # 🔑 ENERGY GATE (BEFORE NORMALIZATION)
+    # =========================
+
+    rms = np.sqrt(np.mean(samples ** 2))
+    zcr = zero_crossing_rate(samples)
+    voiced_sec = voiced_duration(samples, TARGET_SR, thresh=0.02)
+
+    print(
+        f"[DEBUG] rms={rms:.4f} "
+        f"zcr={zcr:.3f} "
+        f"voiced={voiced_sec:.3f}s"
+    )
+
+    if (
+        rms < MIN_AUDIO_RMS or
+        zcr < ZCR_MIN or zcr > ZCR_MAX or
+        voiced_sec < MIN_VOICED_SECONDS
+    ):
+        print("[AUDIO] Dropped noise")
+        return {"skip": True}
+
+    # remove DC offset
     samples -= np.mean(samples)
+
+    # normalize AFTER gating
     peak = np.max(np.abs(samples))
     if peak > 0:
         samples /= peak
 
     # =========================
-    # ASR (ALWAYS ON)
+    # ASR
     # =========================
 
     async with asr_lock:
@@ -217,20 +257,17 @@ async def infer(
 
         if "pause" in t and "unpause" not in t:
             paused_sessions.add(session_id)
-            print(f"[COMMAND] PAUSE session={session_id}")
             return {"command": "pause"}
 
         if "unpause" in t:
             paused_sessions.discard(session_id)
-            print(f"[COMMAND] UNPAUSE session={session_id}")
             return {"command": "unpause"}
 
     # =========================
-    # PAUSED MODE → ASR ONLY
+    # PAUSED MODE
     # =========================
 
     if session_id in paused_sessions:
-        print("[STATE] Paused — ASR active, LLM/TTS blocked")
         return {"paused": True, "transcript": transcript}
 
     history = user_histories[session_id]
