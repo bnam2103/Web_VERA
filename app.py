@@ -34,7 +34,7 @@ MIN_AUDIO_BYTES = 1500
 MIN_AUDIO_RMS = 0.015  # 🔑 ENERGY GATE (MATCHES FRONTEND)
 MIN_VOICED_SECONDS = 0.05   # 🔑 NEW
 ZCR_MIN = 0.01
-ZCR_MAX = 0.35            # 🔑 NEW (TUNER; fast speech fails with lower number)
+ZCR_MAX = 0.40            # 🔑 NEW (TUNER; fast speech fails with lower number)
 
 MAX_FEEDBACK_BYTES = 1 * 1024 * 1024  # 1 MB
 
@@ -113,16 +113,17 @@ def check_time():
 def check_date():
     return f"Today's date is {datetime.now().strftime('%A, %B %d, %Y')}."
 
-def detect_intent(text: str) -> str | None:
+def detect_intent(text: str, history) -> str | None:
     cleaned = text.lower().translate(
         str.maketrans("", "", string.punctuation)
     )
+    messages = build_messages(history, cleaned)
+    reply = vera.generate(messages).strip()
 
-    if any(k in cleaned for k in ["current time"]):
+    if any(k in reply for k in ["current time", "realtime", "real time"]):
         return "time"
-    if any(k in cleaned for k in ["current date"]):
+    if any(k in reply for k in ["current date"]):
         return "date"
-
     return None
 
 # =========================
@@ -287,12 +288,16 @@ async def infer(
     # LLM
     # =========================
 
-    intent = detect_intent(transcript)
+    intent = detect_intent(transcript, history)
 
     if intent == "time":
         reply = check_time()
+        history.append({"role": "user", "content": transcript})
+        history.append({"role": "assistant", "content": reply})
     elif intent == "date":
         reply = check_date()
+        history.append({"role": "user", "content": transcript})
+        history.append({"role": "assistant", "content": reply})
     else:
         messages = build_messages(history, transcript)
         async with llm_lock:
